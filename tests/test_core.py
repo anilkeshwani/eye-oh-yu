@@ -11,9 +11,16 @@ def test_parse_amount():
     assert core.parse_amount("42.5") == 4250
     assert core.parse_amount("0.01") == 1
     assert core.parse_amount("1e2") == 10000
+    assert core.parse_amount(".5") == 50
+    assert core.parse_amount("5.") == 500
+    assert core.parse_amount("+5") == 500
+    assert core.parse_amount("9" * 26 + ".99") == int("9" * 26 + "99")
 
 
-@pytest.mark.parametrize("bad", ["0", "0.00", "-3", "1.999", "abc", "", "nan"])
+@pytest.mark.parametrize(
+    "bad",
+    ["0", "0.00", "-3", "1.999", "abc", "", "nan", "1_000", "9" * 26 + ".999"],
+)
 def test_parse_amount_rejects_bad_input(bad):
     with pytest.raises(core.InvalidAmount):
         core.parse_amount(bad)
@@ -24,10 +31,20 @@ def test_equal_split_rounding(conn, three_people):
         conn, payer="Alice", amount_cents=10000, description="lunch",
         split=["Alice", "Bob", "Carol"],
     )
-    shares = [s["amount_cents"] for s in expense["shares"]]
-    assert sum(shares) == 10000
-    assert sorted(shares, reverse=True) == [3334, 3333, 3333]
+    assert {s["person"]["name"]: s["amount_cents"] for s in expense["shares"]} == {
+        "Alice": 3334, "Bob": 3333, "Carol": 3333,
+    }
     assert expense["split_mode"] == "equal"
+
+
+def test_equal_split_leftover_follows_list_order(conn, three_people):
+    expense = core.add_expense(
+        conn, payer="Carol", amount_cents=10000, description="lunch",
+        split=["Carol", "Alice", "Bob"],
+    )
+    assert {s["person"]["name"]: s["amount_cents"] for s in expense["shares"]} == {
+        "Carol": 3334, "Alice": 3333, "Bob": 3333,
+    }
 
 
 def test_equal_split_too_small(conn, three_people):
@@ -116,6 +133,7 @@ def test_correct_equal_expense_recomputes_shares(conn, three_people):
         conn, original["id"], reason="amount was wrong", amount_cents=3300
     )
     assert corrected["id"] != original["id"]
+    assert corrected["supersedes"] == original["id"]
     assert [s["amount_cents"] for s in corrected["shares"]] == [1100, 1100, 1100]
     refreshed_original = core.get_expense(conn, original["id"])
     assert refreshed_original["voided"] is True
@@ -289,6 +307,32 @@ def test_correct_settlement(conn, three_people):
         conn, settlement["id"], reason="wrong amount", amount_cents=1200
     )
     assert corrected["amount_cents"] == 1200
+    assert corrected["supersedes"] == settlement["id"]
     refreshed = core.get_settlement(conn, settlement["id"])
     assert refreshed["voided"] is True
     assert refreshed["superseded_by"] == corrected["id"]
+
+
+def test_accented_names_are_case_insensitive(conn):
+    core.add_person(conn, "Élodie")
+    with pytest.raises(core.DuplicatePerson):
+        core.add_person(conn, "élodie")
+    assert core.resolve_person(conn, "ÉLODIE")["name"] == "Élodie"
+
+
+def test_handle_casefold_lookup(conn):
+    core.add_person(conn, "Anil", slack_handle="anil")
+    assert core.resolve_person(conn, "@ANIL")["name"] == "Anil"
+
+
+def test_conflicting_split_selectors_rejected(conn, three_people):
+    with pytest.raises(core.InvalidValue):
+        core.add_expense(
+            conn, payer="Alice", amount_cents=1000, description="lunch",
+            split=["Alice", "Bob"], include_all=True,
+        )
+    with pytest.raises(core.InvalidValue):
+        core.add_expense(
+            conn, payer="Alice", amount_cents=1000, description="lunch",
+            split=["Alice", "Bob"], shares=[("Alice", 1000)],
+        )

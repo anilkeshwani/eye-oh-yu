@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 
 from . import core, db
@@ -87,6 +88,8 @@ def expense_detail(expense):
         lines.append(f"  share     {share['person']['name']}: {share['amount']}")
     if expense["voided"]:
         lines.append(f"  VOIDED    {expense['void_reason']}")
+    if expense["supersedes"] is not None:
+        lines.append(f"  corrects expense #{expense['supersedes']}")
     if expense["superseded_by"] is not None:
         lines.append(f"  replaced by expense #{expense['superseded_by']}")
     return "\n".join(lines)
@@ -154,6 +157,16 @@ def parse_share_arg(text):
     if not sep or not ref.strip():
         raise argparse.ArgumentTypeError("expected NAME=AMOUNT, e.g. alice=12.50")
     return ref.strip(), amount.strip()
+
+
+def non_negative_int(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("--limit must not be negative")
+    return value
 
 
 def parse_split_arg(text):
@@ -267,6 +280,8 @@ def cmd_settle_show(args, conn, db_path):
     lines.append(f"  created   {settlement['created_at']}")
     if settlement["voided"]:
         lines.append(f"  VOIDED    {settlement['void_reason']}")
+    if settlement["supersedes"] is not None:
+        lines.append(f"  corrects settlement #{settlement['supersedes']}")
     if settlement["superseded_by"] is not None:
         lines.append(f"  replaced by settlement #{settlement['superseded_by']}")
     return {"data": settlement, "human": "\n".join(lines)}
@@ -417,7 +432,7 @@ def build_parser():
     p.add_argument("--until", help="YYYY-MM-DD, today or yesterday")
     p.add_argument("--category")
     p.add_argument("--include-voided", action="store_true")
-    p.add_argument("--limit", type=int)
+    p.add_argument("--limit", type=non_negative_int)
     p.set_defaults(func=cmd_expense_list)
 
     p = esub.add_parser("show", parents=[common], help="show one expense")
@@ -465,7 +480,7 @@ def build_parser():
     p = ssub.add_parser("list", parents=[common], help="list settlements")
     p.add_argument("--person", help="name, @handle or slack id")
     p.add_argument("--include-voided", action="store_true")
-    p.add_argument("--limit", type=int)
+    p.add_argument("--limit", type=non_negative_int)
     p.set_defaults(func=cmd_settle_list)
 
     p = ssub.add_parser("show", parents=[common], help="show one settlement")
@@ -518,10 +533,13 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         db_path = db.resolve_db_path(args.db)
+    except ValueError as error:
+        print(f"usage error: {error}", file=sys.stderr)
+        return 2
+    try:
         conn = db.connect(db_path)
-    except (OSError, RuntimeError) as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 1
+    except (OSError, RuntimeError, sqlite3.Error) as error:
+        return fail(core.DBError(f"cannot open database at {db_path}: {error}"), args.json_output)
     try:
         result = args.func(args, conn, db_path)
     except core.IOUError as error:

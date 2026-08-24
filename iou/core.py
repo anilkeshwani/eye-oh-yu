@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import sqlite3
 from decimal import Decimal, InvalidOperation
 
 CURRENCY = "EUR"
@@ -65,18 +66,26 @@ class SelfSettlement(IOUError):
     code = "self_settlement"
 
 
+class DBError(IOUError):
+    code = "db_error"
+
+
 def parse_amount(text: str) -> int:
     s = str(text).strip().replace(",", ".")
+    if "_" in s:
+        raise InvalidAmount(f"invalid amount: {text!r}")
     try:
         value = Decimal(s)
     except InvalidOperation:
         raise InvalidAmount(f"invalid amount: {text!r}") from None
     if not value.is_finite():
         raise InvalidAmount(f"invalid amount: {text!r}")
-    cents = value * 100
-    if cents != cents.to_integral_value():
+    sign, digits, exponent = value.as_tuple()
+    if exponent < -2:
         raise InvalidAmount(f"amount {text!r} has more than two decimal places")
-    result = int(cents)
+    result = int("".join(str(digit) for digit in digits)) * 10 ** (exponent + 2)
+    if sign:
+        result = -result
     if result <= 0:
         raise InvalidAmount(f"amount must be positive, got {text!r}")
     return result
@@ -140,16 +149,44 @@ def _person_by_id(conn, person_id):
     return conn.execute("SELECT * FROM person WHERE id = ?", (person_id,)).fetchone()
 
 
+def _find_by_name(conn, name):
+    row = conn.execute("SELECT * FROM person WHERE name = ?", (name,)).fetchone()
+    if row is not None:
+        return row
+    target = name.casefold()
+    return next(
+        (row for row in conn.execute("SELECT * FROM person") if row["name"].casefold() == target),
+        None,
+    )
+
+
+def _find_by_handle(conn, handle):
+    handle = handle.strip()
+    if not handle:
+        return None
+    row = conn.execute("SELECT * FROM person WHERE slack_handle = ?", (handle,)).fetchone()
+    if row is not None:
+        return row
+    target = handle.casefold()
+    return next(
+        (
+            row
+            for row in conn.execute("SELECT * FROM person")
+            if row["slack_handle"] is not None and row["slack_handle"].casefold() == target
+        ),
+        None,
+    )
+
+
 def resolve_person(conn, ref, *, allow_archived=False):
     text = str(ref or "").strip()
     if not text:
         raise UnknownPerson("empty person reference")
     row = conn.execute("SELECT * FROM person WHERE slack_id = ?", (text,)).fetchone()
     if row is None:
-        handle = text.removeprefix("@")
-        row = conn.execute("SELECT * FROM person WHERE slack_handle = ?", (handle,)).fetchone()
+        row = _find_by_handle(conn, text.removeprefix("@"))
     if row is None:
-        row = conn.execute("SELECT * FROM person WHERE name = ?", (text,)).fetchone()
+        row = _find_by_name(conn, text)
     if row is None:
         known = [r["name"] for r in conn.execute("SELECT name FROM person ORDER BY name")]
         raise UnknownPerson(f"no person matches {text!r}", ref=text, known_people=known)
@@ -166,17 +203,22 @@ def add_person(conn, name, *, slack_id=None, slack_handle=None):
         raise InvalidValue("person name must not be empty")
     slack_id = _clean_optional(slack_id)
     slack_handle = _clean_handle(slack_handle)
-    existing = conn.execute("SELECT * FROM person WHERE name = ?", (clean_name,)).fetchone()
+    existing = _find_by_name(conn, clean_name)
     if existing is not None:
         raise DuplicatePerson(
             f"a person named {existing['name']!r} already exists", person_id=existing["id"]
         )
     _check_slack_unique(conn, slack_id, slack_handle)
-    with conn:
-        cur = conn.execute(
-            "INSERT INTO person (name, slack_id, slack_handle) VALUES (?, ?, ?)",
-            (clean_name, slack_id, slack_handle),
-        )
+    try:
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO person (name, slack_id, slack_handle) VALUES (?, ?, ?)",
+                (clean_name, slack_id, slack_handle),
+            )
+    except sqlite3.IntegrityError:
+        raise DuplicatePerson(
+            "name, handle or slack id is already in use",
+        ) from None
     return person_dict(_person_by_id(conn, cur.lastrowid))
 
 
@@ -188,9 +230,7 @@ def _check_slack_unique(conn, slack_id=None, slack_handle=None, exclude_id=None)
                 f"slack id {slack_id} already belongs to {row['name']!r}", person_id=row["id"]
             )
     if slack_handle is not None:
-        row = conn.execute(
-            "SELECT * FROM person WHERE slack_handle = ?", (slack_handle,)
-        ).fetchone()
+        row = _find_by_handle(conn, slack_handle)
         if row is not None and row["id"] != exclude_id:
             raise DuplicatePerson(
                 f"handle @{slack_handle} already belongs to {row['name']!r}", person_id=row["id"]
@@ -210,10 +250,8 @@ def rename_person(conn, ref, new_name):
     clean = _clean_optional(new_name)
     if clean is None:
         raise InvalidValue("new name must not be empty")
-    clash = conn.execute(
-        "SELECT * FROM person WHERE name = ? AND id != ?", (clean, row["id"])
-    ).fetchone()
-    if clash is not None:
+    clash = _find_by_name(conn, clean)
+    if clash is not None and clash["id"] != row["id"]:
         raise DuplicatePerson(
             f"a person named {clash['name']!r} already exists", person_id=clash["id"]
         )
@@ -229,13 +267,18 @@ def link_person(conn, ref, *, slack_id=None, slack_handle=None):
     if slack_id is None and slack_handle is None:
         raise InvalidValue("provide --slack-id or --handle")
     _check_slack_unique(conn, slack_id, slack_handle, exclude_id=row["id"])
-    with conn:
-        if slack_id is not None:
-            conn.execute("UPDATE person SET slack_id = ? WHERE id = ?", (slack_id, row["id"]))
-        if slack_handle is not None:
-            conn.execute(
-                "UPDATE person SET slack_handle = ? WHERE id = ?", (slack_handle, row["id"])
-            )
+    try:
+        with conn:
+            if slack_id is not None:
+                conn.execute(
+                    "UPDATE person SET slack_id = ? WHERE id = ?", (slack_id, row["id"])
+                )
+            if slack_handle is not None:
+                conn.execute(
+                    "UPDATE person SET slack_handle = ? WHERE id = ?", (slack_handle, row["id"])
+                )
+    except sqlite3.IntegrityError:
+        raise DuplicatePerson("name, handle or slack id is already in use") from None
     return person_dict(_person_by_id(conn, row["id"]))
 
 
@@ -330,16 +373,43 @@ def _exact_entries(conn, shares, amount_cents):
     return entries
 
 
+def _check_split_selectors(shares, split, include_all):
+    provided = sum((bool(shares), split is not None, bool(include_all)))
+    if provided > 1:
+        raise InvalidValue("use at most one of --split, --share or --all")
+
+
 def _insert_expense(
-    conn, *, description, amount_cents, payer_id, spent_at, category, source, split_mode, entries
+    conn,
+    *,
+    description,
+    amount_cents,
+    payer_id,
+    spent_at,
+    category,
+    source,
+    split_mode,
+    entries,
+    supersedes=None,
 ):
     cur = conn.execute(
         """
         INSERT INTO expense
-            (description, amount_cents, currency, payer_id, spent_at, category, source, split_mode)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (description, amount_cents, currency, payer_id, spent_at, category, source,
+             split_mode, supersedes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (description, amount_cents, CURRENCY, payer_id, spent_at, category, source, split_mode),
+        (
+            description,
+            amount_cents,
+            CURRENCY,
+            payer_id,
+            spent_at,
+            category,
+            source,
+            split_mode,
+            supersedes,
+        ),
     )
     expense_id = cur.lastrowid
     for row, cents in entries:
@@ -369,6 +439,7 @@ def add_expense(
         raise InvalidValue("description must not be empty")
     if amount_cents <= 0:
         raise InvalidAmount("amount must be positive")
+    _check_split_selectors(shares, split, include_all)
     if shares:
         entries = _exact_entries(conn, shares, amount_cents)
         split_mode = "exact"
@@ -424,6 +495,7 @@ def expense_dict(conn, row) -> dict:
         "split_mode": row["split_mode"],
         "voided": bool(row["voided"]),
         "void_reason": row["void_reason"],
+        "supersedes": row["supersedes"],
         "superseded_by": row["superseded_by"],
         "shares": shares,
     }
@@ -465,6 +537,7 @@ def correct_expense(
         raise NotFound(f"expense {expense_id} not found", id=expense_id)
     if original["voided"]:
         raise AlreadyVoided(f"expense {expense_id} is already voided")
+    _check_split_selectors(shares, split, include_all)
 
     new_description = (
         _clean_optional(description) if description is not None else original["description"]
@@ -521,6 +594,7 @@ def correct_expense(
             source=new_source,
             split_mode=split_mode,
             entries=entries,
+            supersedes=expense_id,
         )
         conn.execute(
             "UPDATE expense SET voided = 1, void_reason = ?, superseded_by = ? WHERE id = ?",
@@ -603,6 +677,7 @@ def settlement_dict(conn, row) -> dict:
         "created_at": row["created_at"],
         "voided": bool(row["voided"]),
         "void_reason": row["void_reason"],
+        "supersedes": row["supersedes"],
         "superseded_by": row["superseded_by"],
     }
 
@@ -656,9 +731,9 @@ def correct_settlement(
     new_source = _clean_optional(source) if source is not UNSET else original["source"]
     with conn:
         cur = conn.execute(
-            "INSERT INTO settlement (from_id, to_id, amount_cents, note, source) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (sender_id, receiver_id, new_amount, new_note, new_source),
+            "INSERT INTO settlement (from_id, to_id, amount_cents, note, source, supersedes) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (sender_id, receiver_id, new_amount, new_note, new_source, settlement_id),
         )
         conn.execute(
             "UPDATE settlement SET voided = 1, void_reason = ?, superseded_by = ? WHERE id = ?",

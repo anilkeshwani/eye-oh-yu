@@ -49,7 +49,8 @@ Domain failure, exit code 1:
 Error codes: `unknown_person`, `duplicate_person`, `archived_person`,
 `person_in_use`, `invalid_value`, `invalid_amount`, `invalid_date`,
 `invalid_split`, `sum_mismatch`, `not_found`, `already_voided`,
-`self_settlement`, `internal`.
+`self_settlement`, `db_error`, `internal`. `db_error` means the database
+file could not be opened (wrong path, corrupt file, permissions).
 
 ## Person identifiers
 
@@ -80,7 +81,8 @@ runs CLI commands, the agent replies in the thread.
 ## Ledger rules
 
 - Append-only. Rows are never mutated. `void` marks a row with a reason,
-  `correct` inserts a fixed copy and links it via `superseded_by`.
+  `correct` inserts a fixed copy and links both directions via
+  `supersedes` and `superseded_by`.
 - Positive balance: the group owes that person. Negative: they owe the
   group. All balances always sum to zero.
 - `iou settle add FROM TO AMOUNT` means FROM repaid TO, i.e. FROM owed TO.

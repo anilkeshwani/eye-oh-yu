@@ -37,7 +37,9 @@ iou person delete Bob      # only works if Bob has no transactions
 Anywhere a person is referenced (`--payer`, `--split`, `--share`, `settle`
 endpoints, `--person` filters) you can use the name, the Slack handle with or
 without the leading `@`, or the Slack member id. Resolution tries Slack id
-first, then handle, then name. Names and handles are case-insensitive.
+first, then handle, then name. Names and handles are matched
+case-insensitively using full Unicode case folding, so `Élodie` and
+`élodie` are the same name.
 
 Archived people are excluded from new expenses and from `--all` splits, but
 can still make or receive settlements so their old debts can be closed out.
@@ -90,10 +92,13 @@ iou expense correct 3 --reason "amount was wrong" --amount 45.50
 ```
 
 `void` marks the row as voided with a reason. `correct` inserts a corrected
-copy and links the two: the original is voided and its `superseded_by` points
-at the replacement. Fields you do not pass are copied from the original. On
-an equal-split expense, changing the amount recomputes the equal shares. On
-an exact-split expense, changing the amount requires new `--share` values.
+copy and links the two in both directions: the original is voided and its
+`superseded_by` points at the replacement, and the replacement's `supersedes`
+points back at the original. Fields you do not pass are copied from the
+original. On an equal-split expense, changing the amount recomputes the
+equal shares; if no new `--split` is given, the same people keep equal
+shares and leftover cents are assigned in person id order. On an exact-split
+expense, changing the amount requires new `--share` values.
 Voided expenses are excluded from balances but stay in the database, so the
 full history of a correction is one query away.
 

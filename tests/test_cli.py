@@ -209,3 +209,92 @@ def test_io_not_created_on_help():
     with pytest.raises(SystemExit) as excinfo:
         main(["--help"])
     assert excinfo.value.code == 0
+
+
+def test_directory_as_db_returns_json_error(tmp_path, capsys):
+    code = main(["balances", "--db", str(tmp_path), "--json"])
+    out, _ = capsys.readouterr()
+    assert code == 1
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "db_error"
+
+
+def test_corrupt_db_returns_json_error(tmp_path, capsys):
+    bad = tmp_path / "bad.db"
+    bad.write_text("this is not a sqlite database")
+    code = main(["balances", "--db", str(bad), "--json"])
+    out, _ = capsys.readouterr()
+    assert code == 1
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "db_error"
+
+
+def test_db_error_without_json_goes_to_stderr(tmp_path, capsys):
+    code = main(["balances", "--db", str(tmp_path)])
+    out, err = capsys.readouterr()
+    assert code == 1
+    assert out == ""
+    assert err.startswith("error: ")
+
+
+def test_empty_db_flag_is_usage_error(tmp_path, capsys):
+    code = main(["balances", "--db", ""])
+    _, err = capsys.readouterr()
+    assert code == 2
+    assert "usage error" in err
+
+
+def test_negative_limit_is_usage_error(tmp_path):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["expense", "list", "--limit", "-1", "--db", str(tmp_path / "cli.db")])
+    assert excinfo.value.code == 2
+
+
+def test_conflicting_split_selectors_via_cli(tmp_path, capsys):
+    add_people(tmp_path, capsys, "Alice", "Bob")
+    code, out, _ = run(
+        tmp_path, capsys,
+        "expense", "add", "--payer", "Alice", "--amount", "10.00", "--desc", "Lunch",
+        "--all", "--split", "Alice,Bob", json_output=True,
+    )
+    assert code == 1
+    assert json.loads(out)["error"]["code"] == "invalid_value"
+
+
+def test_person_link_unlink_archive_delete_via_cli(tmp_path, capsys):
+    add_people(tmp_path, capsys, "Alice", "Bob")
+    code, out, _ = run(
+        tmp_path, capsys,
+        "person", "link", "Alice", "--handle", "alice", "--slack-id", "U001",
+        json_output=True,
+    )
+    assert code == 0
+    linked = json.loads(out)["data"]
+    assert linked["slack_handle"] == "alice"
+    assert linked["slack_id"] == "U001"
+
+    code, out, _ = run(tmp_path, capsys, "person", "unlink", "U001", json_output=True)
+    assert code == 0
+    assert json.loads(out)["data"]["slack_id"] is None
+
+    code, out, _ = run(tmp_path, capsys, "person", "link", "Alice", "--slack-id", "U001")
+    assert code == 0
+    code, out, _ = run(tmp_path, capsys, "person", "archive", "Bob", json_output=True)
+    assert json.loads(out)["data"]["archived"] is True
+    code, out, _ = run(tmp_path, capsys, "person", "unarchive", "Bob", json_output=True)
+    assert json.loads(out)["data"]["archived"] is False
+
+    code, _, _ = run(tmp_path, capsys, "person", "delete", "Bob")
+    assert code == 0
+    code, out, _ = run(tmp_path, capsys, "person", "list", json_output=True)
+    assert [p["name"] for p in json.loads(out)["data"]["people"]] == ["Alice"]
+
+
+def test_init_json(tmp_path, capsys):
+    code, out, _ = run(tmp_path, capsys, "init", json_output=True)
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["ok"] is True
+    assert payload["data"]["db"].endswith("cli.db")
